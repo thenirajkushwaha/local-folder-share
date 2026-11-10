@@ -1,0 +1,266 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+
+% Page styling
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\textbf{Arch Linux Peer-to-Peer Transfer}}
+\lhead{Technical Documentation}
+\rfoot{Page \thepage}
+
+% Color palette for code & aesthetics
+\definecolor{codegreen}{rgb}{0.2,0.6,0.2}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{codeblue}{rgb}{0.13,0.34,0.68}
+\definecolor{backcolour}{rgb}{0.96,0.97,0.98}
+
+\lstdefinestyle{codeblock}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codeblue}\bfseries,
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2,
+    frame=single,
+    rulecolor=\color{codegray}
+}
+
+\lstdefinestyle{bashblock}{
+    backgroundcolor=\color{backcolour},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    rulecolor=\color{codegray}
+}
+
+\lstset{style=codeblock}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=codeblue,
+    urlcolor=codeblue
+}
+
+\title{\textbf{\Huge Arch Linux Local Peer-to-Peer Folder \& File Transfer}\\[0.3em]
+\Large Technical Reference, Architecture, and User Manual}
+\author{\textbf{Bare-Minimum C++ Systems Implementation}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\vspace{1.5em}
+\hrule
+\vspace{1.5em}
+
+\section{Introduction and Overview}
+Transferring files and directory trees between adjacent Arch Linux workstations on a Local Area Network (LAN) often involves friction—requiring flash drives, cloud storage intermediaries, or complex network share configurations (such as Samba or NFS).
+
+This software provides a **bare-minimum, zero-external-dependency** tool implemented strictly in standard C++23, POSIX system calls, and minimal X11/XDnD. It allows two machines on the same WiFi or Ethernet network to:
+\begin{enumerate}
+    \item \textbf{Auto-discover} each other without manual IP configuration.
+    \item \textbf{Switch roles} via a single button (acting as a background \textit{Client/Receiver} or an interactive \textit{Sender}).
+    \item \textbf{Preserve full metadata}: File permissions (\texttt{chmod}), modification timestamps (\texttt{mtime}), and access timestamps (\texttt{atime}) are mirrored on the destination.
+    \item \textbf{Stream recursively}: Entire nested folder trees and arbitrary files stream in chunked batches over raw TCP sockets.
+    \item \textbf{Drag-and-Drop}: Drag files or directories directly from file managers (e.g., KDE Dolphin) into the application window.
+\end{enumerate}
+
+\section{Technology Stack \& Architecture}
+
+\subsection{Architectural Principles}
+\begin{itemize}
+    \item \textbf{Language Standard}: C++23 (\texttt{g++ -std=c++23}).
+    \item \textbf{No External Frameworks}: Zero third-party packages (no Qt, GTK, Boost, Asio, or Curl).
+    \item \textbf{Display System}: Raw \texttt{libX11} client integration, natively compatible with Wayland (KDE Plasma) via XWayland.
+    \item \textbf{Networking}: Raw Berkeley / POSIX socket interfaces (\texttt{AF\_INET}, \texttt{SOCK\_DGRAM} for discovery, \texttt{SOCK\_STREAM} for transfers).
+\end{itemize}
+
+\subsection{Communication Protocols}
+
+\subsubsection{1. Automatic Discovery Subsystem (UDP)}
+Nodes periodically broadcast heartbeat packets on the subnet broadcast address (\texttt{255.255.255.255}) over port \texttt{UDP 50000}:
+\begin{itemize}
+    \item \textbf{Interval}: Heartbeats fire every $2$ seconds.
+    \item \textbf{Payload Format}: Packed binary structure containing protocol magic (\texttt{0x44495343}), listening TCP transfer port, role status (Client vs Sender), and local hostname.
+    \item \textbf{Liveness Evaluation}: Active peers are refreshed in the list; peers silent for $>8$ seconds are pruned automatically.
+\end{itemize}
+
+\subsubsection{2. Multi-Item Stream Transfer Subsystem (TCP)}
+Transfers execute over direct point-to-point connections on port \texttt{TCP 50001}:
+\begin{itemize}
+    \item Every file/directory is preceded by a packed \texttt{PacketHeader}:
+    \begin{lstlisting}[language=C++]
+struct PacketHeader {
+    uint8_t entry_type;  // REGULAR_FILE = 1, DIRECTORY = 2, END = 255
+    uint32_t path_len;   // UTF-8 path length
+    uint64_t file_size;  // Size in bytes (0 for directory)
+    uint32_t mode;       // st_mode permissions & file type
+    int64_t  mtime_sec;  // Modification timestamp (sec)
+    int64_t  mtime_nsec; // Modification timestamp (nsec)
+    int64_t  atime_sec;  // Access timestamp (sec)
+    int64_t  atime_nsec; // Access timestamp (nsec)
+};
+    \end{lstlisting}
+    \item \textbf{Data Streaming}: Files are streamed in 64\,KB chunks (\texttt{65536} bytes), keeping memory usage constant regardless of file size.
+    \item \textbf{Metadata Restoration}: Upon receiving the terminal \texttt{END\_OF\_BATCH} packet, the receiver applies filesystem timestamps (\texttt{utimensat}) and permission masks (\texttt{chmod}) in reverse topological order so directory attributes are preserved.
+\end{itemize}
+
+\subsubsection{3. Drag-and-Drop Engine (X11 / XDnD)}
+Drag-and-drop utilizes the standard X11 Drag-and-Drop protocol version 5 (\texttt{XdndAware}, \texttt{XdndEnter}, \texttt{XdndPosition}, \texttt{XdndDrop}, \texttt{XdndSelection}):
+\begin{itemize}
+    \item Decodes dropped MIME payloads of type \texttt{text/uri-list}.
+    \item Converts \texttt{file://} encoded URIs into native POSIX filesystem paths.
+\end{itemize}
+
+\section{Building from Source}
+
+The program does not require system-wide installation. Compile with the included \texttt{Makefile}:
+
+\begin{lstlisting}[style=bashblock]
+# Navigate to the project directory
+cd folder-sharing
+
+# Build the standalone binary
+make clean && make
+\end{lstlisting}
+
+This produces an optimized binary named \texttt{folder\_share}.
+
+\section{Usage and Command Reference}
+
+\subsection{Graphical Mode (GUI)}
+To start in graphical mode (default):
+\begin{lstlisting}[style=bashblock]
+./folder_share
+\end{lstlisting}
+
+\subsubsection{Interface Modes}
+\begin{itemize}
+    \item \textbf{Client / Receiver Mode}: 
+    \begin{itemize}
+        \item Click the \texttt{[ Client / Receiver ]} button.
+        \item The application listens on port \texttt{50001}. Any incoming file or directory tree is saved automatically to \texttt{\textasciitilde/Downloads}.
+    \end{itemize}
+    \item \textbf{Sender Mode}:
+    \begin{itemize}
+        \item Click the \texttt{[ Sender ]} button.
+        \item The left pane lists all automatically discovered machines on the network.
+        \item Click a target peer in the list.
+        \item Drag and drop any file or folder from your file manager (Dolphin) into the dropzone on the right.
+        \item The transfer starts immediately with real-time progress.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Command-Line Interface (CLI)}
+
+The binary includes full CLI functionality for headless systems or terminal scripts.
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Command} & \textbf{Description} \\ \midrule
+\texttt{./folder\_share --cli receive} & Runs as a receiver daemon; saves files to \texttt{\textasciitilde/Downloads}. \\
+\texttt{./folder\_share --cli list} & Broadcasts and prints discovered network peers. \\
+\texttt{./folder\_share --cli send <peer-idx|ip> <paths...>} & Sends files or folders to a discovered peer or IP. \\
+\texttt{./folder\_share --help} & Displays command usage summary. \\ \bottomrule
+\end{tabular}
+\caption{CLI Command Reference}
+\end{table}
+
+\section{Step-by-Step Practical Use Cases}
+
+\subsection{Use Case 1: GUI Drag-and-Drop Sharing}
+\textbf{Scenario}: Desktop $A$ (\textit{Arch-Desktop}) wants to share a project directory \texttt{\textasciitilde/Projects/MyEngine} to Laptop $B$ (\textit{Arch-Laptop}).
+
+\begin{enumerate}
+    \item On Laptop $B$, launch the app:
+    \begin{lstlisting}[style=bashblock]
+./folder_share
+    \end{lstlisting}
+    Leave it on the default \texttt{[ Client / Receiver ]} mode.
+    \item On Desktop $A$, launch the app:
+    \begin{lstlisting}[style=bashblock]
+./folder_share
+    \end{lstlisting}
+    Click \texttt{[ Sender ]}.
+    \item Desktop $A$ immediately sees \texttt{Arch-Laptop (192.168.1.42:50001)} in the peer list. Click on it.
+    \item Open Dolphin, drag the \texttt{MyEngine} folder, and drop it into the dropzone.
+    \item The entire folder tree is transferred into \texttt{\textasciitilde/Downloads/MyEngine} on Laptop $B$ with permissions and timestamps intact.
+\end{enumerate}
+
+\subsection{Use Case 2: Terminal / Headless CLI Transfer}
+\textbf{Scenario}: You are SSH'd into a remote Arch workstation and want to receive files from your local terminal.
+
+\begin{enumerate}
+    \item On the receiving machine:
+    \begin{lstlisting}[style=bashblock]
+./folder_share --cli receive
+    \end{lstlisting}
+    \textit{Output:}
+    \begin{lstlisting}[style=bashblock]
+[Client Mode] Starting receiver...
+[Client Mode] Saving incoming files to: /home/niraj/Downloads
+[Client Mode] Hostname: Arch-Receiver
+[Client Mode] Listening on TCP port 50001 and broadcasting presence on UDP 50000
+    \end{lstlisting}
+
+    \item On the sender machine, list available peers:
+    \begin{lstlisting}[style=bashblock]
+./folder_share --cli list
+    \end{lstlisting}
+    \textit{Output:}
+    \begin{lstlisting}[style=bashblock]
+Discovered Peers (1 found):
+--------------------------------------------------------
+Index Hostname                  IP Address        Port    
+--------------------------------------------------------
+[1]   Arch-Receiver             192.168.1.42      50001   
+--------------------------------------------------------
+    \end{lstlisting}
+
+    \item Send the directory using the discovered peer index \texttt{1}:
+    \begin{lstlisting}[style=bashblock]
+./folder_share --cli send 1 ~/Documents/Research ~/Pictures/photo.png
+    \end{lstlisting}
+    \textit{Output:}
+    \begin{lstlisting}[style=bashblock]
+[Sender] Connecting to 192.168.1.42:50001...
+[↑] Sending: Research/report.pdf [4.20 MB / 4.20 MB] (100.0%)
+[✓] Transfer complete! (4.20 MB sent)
+    \end{lstlisting}
+\end{enumerate}
+
+\section{Security \& Firewall Considerations}
+\begin{itemize}
+    \item \textbf{Local Network Only}: By design, transfers operate over plaintext TCP for minimal overhead. Only use within trusted local area networks.
+    \item \textbf{Firewall Ports}: If running \texttt{ufw} or \texttt{iptables}, ensure traffic is allowed on:
+    \begin{itemize}
+        \item \texttt{UDP 50000} (Inbound/Outbound LAN broadcast discovery).
+        \item \texttt{TCP 50001} (Inbound file transfer connections on client).
+    \end{itemize}
+\end{itemize}
+
+\end{document}

@@ -1,0 +1,220 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,calc}
+
+% Page styling
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\textbf{folder\_share Developer Internal Reference}}
+\lhead{Arch Linux P2P Share}
+\rfoot{Page \thepage}
+
+% Color palette for code & aesthetics
+\definecolor{codegreen}{rgb}{0.2,0.6,0.2}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{codeblue}{rgb}{0.13,0.34,0.68}
+\definecolor{backcolour}{rgb}{0.96,0.97,0.98}
+
+\lstdefinestyle{codeblock}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codeblue}\bfseries,
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2,
+    frame=single,
+    rulecolor=\color{codegray}
+}
+
+\lstdefinestyle{bashblock}{
+    backgroundcolor=\color{backcolour},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    rulecolor=\color{codegray}
+}
+
+\lstset{style=codeblock}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=codeblue,
+    urlcolor=codeblue
+}
+
+\title{\textbf{\Huge folder\_share Developer Reference \& Internals Guide}\\[0.3em]
+\Large Complete Architecture, Wire Protocol, Concurrency Model, and Extension Guide}
+\author{\textbf{Core Engineering Documentation}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\vspace{1.5em}
+\hrule
+\vspace{1.5em}
+
+\section{Executive Summary \& Build Pipeline}
+
+\subsection{How the Binary was Generated}
+The \texttt{folder\_share} executable is compiled directly from bare C++23 source code using GNU \texttt{g++} with standard POSIX libraries and \texttt{libX11}. There are **no external framework dependencies** (no CMake, Qt, GTK, Boost, Asio, or OpenSSL required).
+
+The compilation stages executed by \texttt{make} are:
+\begin{enumerate}
+    \item \textbf{Compilation}: Each module in \texttt{src/} is compiled into an object file (\texttt{.o}) with \texttt{-std=c++23 -O2 -pthread -Wall -Wextra}:
+    \begin{lstlisting}[style=bashblock]
+g++ -std=c++23 -Wall -Wextra -O2 -pthread -c src/main.cpp -o src/main.o
+g++ -std=c++23 -Wall -Wextra -O2 -pthread -c src/file_util.cpp -o src/file_util.o
+g++ -std=c++23 -Wall -Wextra -O2 -pthread -c src/network.cpp -o src/network.o
+g++ -std=c++23 -Wall -Wextra -O2 -pthread -c src/cli.cpp -o src/cli.o
+g++ -std=c++23 -Wall -Wextra -O2 -pthread -c src/gui.cpp -o src/gui.o
+    \end{lstlisting}
+    \item \textbf{Linking}: All object files are linked together with the POSIX threads runtime and the X11 client library (\texttt{-lX11}):
+    \begin{lstlisting}[style=bashblock]
+g++ src/main.o src/file_util.o src/network.o src/cli.o src/gui.o -o folder_share -std=c++23 -Wall -Wextra -O2 -pthread -lX11
+    \end{lstlisting}
+\end{enumerate}
+
+\section{Codebase Topology \& Module Responsibilities}
+
+The codebase is organized into five decoupled units:
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{File} & \textbf{Component} & \textbf{Core Responsibilities} \\ \midrule
+\texttt{src/protocol.hpp} & Wire Protocol & Binary packet layouts, network magic, and wire constants. \\
+\texttt{src/file\_util.hpp/.cpp} & Filesystem Engine & Recursive directory traversal, POSIX stat \& \texttt{utimensat}. \\
+\texttt{src/network.hpp/.cpp} & Networking Subsystem & UDP LAN discovery broadcast \& streaming TCP transfers. \\
+\texttt{src/gui.hpp/.cpp} & Graphical Interface & Bare X11 rendering, event pump, XDnD Drag-and-Drop. \\
+\texttt{src/cli.hpp/.cpp} & Terminal Interface & Headless client, peer listing, and sender CLI modes. \\
+\texttt{src/main.cpp} & Application Dispatcher & CLI vs GUI routing and argument parsing. \\
+\bottomrule
+\end{tabular}
+\caption{Source Module Directory}
+\end{table}
+
+\section{Deep-Dive Architectural Mechanics}
+
+\subsection{Wire Format and Protocol Specification}
+Communication on the wire uses packed binary structures (\texttt{\#pragma pack(push, 1)}) to guarantee deterministic byte alignment across varying architectures.
+
+\subsubsection{1. Discovery Packet (UDP 50000)}
+Every node broadcasts the following 72-byte structure every 2 seconds to \texttt{255.255.255.255}:
+\begin{lstlisting}[language=C++]
+struct DiscoveryPacket {
+    uint32_t magic;         // DISCOVERY_MAGIC = 0x44495343 ("DISC")
+    uint16_t transfer_port; // TCP port listening for files (default: 50001)
+    uint16_t is_client;     // 1 if Client (Receiver), 0 if Sender
+    char     hostname[64];  // Null-terminated local machine hostname
+};
+\end{lstlisting}
+
+\subsubsection{2. Transfer Protocol (TCP 50001)}
+A transfer session streams multiple files/directories sequentially over a single TCP stream. The stream consists of repeated \texttt{[PacketHeader] + [Path String] + [Payload Data]} units, terminated with an \texttt{END\_OF\_BATCH} packet:
+
+\begin{lstlisting}[language=C++]
+struct PacketHeader {
+    uint8_t  entry_type;  // 1 = REGULAR_FILE, 2 = DIRECTORY, 255 = END_OF_BATCH
+    uint32_t path_len;    // Byte length of relative UTF-8 path string
+    uint64_t file_size;   // Size in bytes (0 for DIRECTORY or END_OF_BATCH)
+    uint32_t mode;        // POSIX st_mode (permissions & file type)
+    int64_t  mtime_sec;   // Modification timestamp seconds (st_mtim.tv_sec)
+    int64_t  mtime_nsec;  // Modification timestamp nanoseconds (st_mtim.tv_nsec)
+    int64_t  atime_sec;   // Access timestamp seconds (st_atim.tv_sec)
+    int64_t  atime_nsec;  // Access timestamp nanoseconds (st_atim.tv_nsec)
+};
+\end{lstlisting}
+
+\subsection{Directory Traversal and Metadata Integrity}
+When transferring a folder:
+\begin{enumerate}
+    \item \texttt{FileUtil::collect\_entries} inspects the source path via \texttt{std::filesystem::recursive\_directory\_iterator}.
+    \item For each item, raw POSIX \texttt{stat()} captures exact permissions (\texttt{st\_mode}) and nanosecond timestamps (\texttt{st\_mtim}, \texttt{st\_atim}).
+    \item The root directory name is preserved as the base path prefix so destination extraction maintains folder names.
+    \item \textbf{Timestamp Preservation Algorithm}: On the receiving end, writing child files updates the parent directory's modification timestamp. To prevent timestamp corruption, the receiver queues received metadata and executes \texttt{utimensat()} and \texttt{chmod()} in **reverse topological order** after all files are closed.
+\end{enumerate}
+
+\subsection{Concurrency and Threading Model}
+The application relies on multi-threaded event isolation:
+\begin{itemize}
+    \item \textbf{Main / UI Thread}: Executes the X11 event loop (\texttt{XNextEvent}), handles user clicks, state mutations, and canvas repaints.
+    \item \textbf{Discovery Daemon Thread}: Continuously fires UDP broadcasts every $2$ seconds and monitors incoming peer announcements, pruning peers with $\Delta t > 8\,\text{s}$.
+    \item \textbf{TCP Server Daemon Thread}: Listens on \texttt{TCP 50001} via \texttt{accept()} and spawns worker threads per incoming connection.
+    \item \textbf{Transfer Worker Threads}: Asynchronously stream file payloads in 64\,KB chunks and invoke synchronized progress callbacks without blocking the UI thread.
+\end{itemize}
+
+\subsection{Bare X11 \& XDnD Drag-and-Drop Implementation}
+Rather than relying on toolkit bloat, the graphical interface interacts directly with the X11 display server:
+\begin{itemize}
+    \item \textbf{XDnD Negotiation}: The window registers as \texttt{XdndAware} (version 5).
+    \item \textbf{Drop Event Handling}: When a drop occurs from Dolphin / file managers:
+    \begin{enumerate}
+        \item Receives \texttt{XdndPosition} and replies with \texttt{XdndStatus} accepting \texttt{XdndActionCopy}.
+        \item Receives \texttt{XdndDrop} and requests the drop selection via \texttt{XConvertSelection(..., "text/uri-list", ...)}.
+        \item Captures \texttt{SelectionNotify}, reads the \texttt{text/uri-list} atom, decodes percent-encoded URIs (\texttt{file:///path/to/item}), and triggers the transfer pipeline.
+    \end{enumerate}
+\end{itemize}
+
+\section{Developer Guide: Extending the System}
+
+\subsection{Adding TLS / Encryption}
+To add encryption without heavyweight libraries:
+\begin{enumerate}
+    \item Introduce an encryption layer abstraction in \texttt{NetworkManager::send\_exact} and \texttt{NetworkManager::recv\_exact}.
+    \item Implement an initial Diffie-Hellman / AES-GCM handshake preceding the \texttt{PacketHeader} exchange.
+\end{enumerate}
+
+\subsection{Configuring Custom Ports}
+Default ports are defined in \texttt{src/protocol.hpp}:
+\begin{lstlisting}[language=C++]
+constexpr uint16_t DEFAULT_DISCOVERY_PORT = 50000;
+constexpr uint16_t DEFAULT_TRANSFER_PORT  = 50001;
+\end{lstlisting}
+You can pass custom ports dynamically to the \texttt{NetworkManager} constructor:
+\begin{lstlisting}[language=C++]
+NetworkManager custom_net(55000, 55001);
+\end{lstlisting}
+
+\subsection{Writing Unit and Regression Tests}
+To build custom automated testing harnesses:
+\begin{lstlisting}[style=bashblock]
+# 1. Start headless receiver on port 50001
+./folder_share --cli receive &
+RECEIVER_PID=$!
+
+# 2. Send test payload
+./folder_share --cli send 127.0.0.1 /path/to/test_folder
+
+# 3. Verify checksum and permissions
+diff -r /path/to/test_folder ~/Downloads/test_folder
+
+# 4. Stop receiver
+kill $RECEIVER_PID
+\end{lstlisting}
+
+\end{document}
